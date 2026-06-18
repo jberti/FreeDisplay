@@ -86,7 +86,7 @@ final class HiDPIService: @unchecked Sendable {
         ]
 
         guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) else {
-            return "生成 Plist 数据失败"
+            return "Failed to generate plist data"
         }
 
         // Write to a temp file first, then use privileged helper to move it
@@ -94,7 +94,7 @@ final class HiDPIService: @unchecked Sendable {
         do {
             try data.write(to: URL(fileURLWithPath: tmpPath), options: .atomic)
         } catch {
-            return "写入临时文件失败：\(error.localizedDescription)"
+            return "Failed to write temp file: \(error.localizedDescription)"
         }
 
         // Use AppleScript to get admin privileges for writing to /Library/Displays/
@@ -131,15 +131,15 @@ final class HiDPIService: @unchecked Sendable {
             """
         var error: NSDictionary?
         guard let appleScript = NSAppleScript(source: script) else {
-            return "创建 AppleScript 失败"
+            return "Failed to create AppleScript"
         }
         appleScript.executeAndReturnError(&error)
         if let error = error {
-            let msg = error[NSAppleScript.errorMessage] as? String ?? "未知错误"
+            let msg = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
             if msg.contains("canceled") || msg.contains("Cancel") {
-                return "用户取消了授权"
+                return "User cancelled authorization"
             }
-            return "管理员授权失败：\(msg)"
+            return "Admin authorization failed: \(msg)"
         }
         return nil
     }
@@ -195,28 +195,20 @@ final class HiDPIService: @unchecked Sendable {
     }
 
     private func generateScaledModes(nativeWidth: Int, nativeHeight: Int) -> [Data] {
-        // Generate HiDPI modes: each entry is 8 bytes big-endian (backingW, backingH)
-        // For a 2560×1440 display, we want:
-        //   1920×1080 HiDPI (backing 3840×2160)
-        //   1600×900  HiDPI (backing 3200×1800)
-        //   1280×720  HiDPI (backing 2560×1440)
-        //   native as HiDPI (backing 5120×2880)
-        var resolutions: [(Int, Int)] = []
+        // macOS scale-resolutions format (16 bytes big-endian per entry):
+        //   bytes 0-3: backing width (2× logical for HiDPI)
+        //   bytes 4-7: backing height
+        //   bytes 8-11: flags (0x1 = HiDPI)
+        //   bytes 12-15: extra flags (0x00200000 for HiDPI modes)
+        // This 16-byte format is what one-key-hidpi and BetterDisplay use.
 
-        // Native resolution as HiDPI (2x backing)
-        resolutions.append((nativeWidth * 2, nativeHeight * 2))
+        var seen: Set<String> = []
+        var result: [Data] = []
 
-        // Scaled HiDPI modes
-        let scales: [Double] = [0.75, 0.625, 0.5]
-        for scale in scales {
-            let logicalW = Int((Double(nativeWidth) * scale).rounded()) & ~1
-            let logicalH = Int((Double(nativeHeight) * scale).rounded()) & ~1
-            guard logicalW >= 800, logicalH >= 600 else { continue }
-            resolutions.append((logicalW * 2, logicalH * 2))
-        }
-
-        return resolutions.map { (backingW, backingH) in
-            var bytes = [UInt8](repeating: 0, count: 8)
+        func addEntry(backingW: Int, backingH: Int, flags: UInt32, extra: UInt32) {
+            let key = "\(backingW)x\(backingH)f\(flags)e\(extra)"
+            guard seen.insert(key).inserted else { return }
+            var bytes = [UInt8](repeating: 0, count: 16)
             bytes[0] = UInt8((backingW >> 24) & 0xFF)
             bytes[1] = UInt8((backingW >> 16) & 0xFF)
             bytes[2] = UInt8((backingW >> 8) & 0xFF)
@@ -225,7 +217,48 @@ final class HiDPIService: @unchecked Sendable {
             bytes[5] = UInt8((backingH >> 16) & 0xFF)
             bytes[6] = UInt8((backingH >> 8) & 0xFF)
             bytes[7] = UInt8(backingH & 0xFF)
-            return Data(bytes)
+            bytes[8] = UInt8((flags >> 24) & 0xFF)
+            bytes[9] = UInt8((flags >> 16) & 0xFF)
+            bytes[10] = UInt8((flags >> 8) & 0xFF)
+            bytes[11] = UInt8(flags & 0xFF)
+            bytes[12] = UInt8((extra >> 24) & 0xFF)
+            bytes[13] = UInt8((extra >> 16) & 0xFF)
+            bytes[14] = UInt8((extra >> 8) & 0xFF)
+            bytes[15] = UInt8(extra & 0xFF)
+            result.append(Data(bytes))
         }
+
+        func addHiDPI(_ logicalW: Int, _ logicalH: Int) {
+            addEntry(backingW: logicalW * 2, backingH: logicalH * 2,
+                     flags: 0x00000001, extra: 0x00200000)
+        }
+
+        func addNonHiDPI(_ w: Int, _ h: Int) {
+            addEntry(backingW: w, backingH: h,
+                     flags: 0x00000009, extra: 0x00A00000)
+        }
+
+        // HiDPI logical modes (backing = 2× logical, GPU-composited)
+        let hiDPIModes: [(Int, Int)] = [
+            (nativeWidth, nativeHeight),           // "looks like native" HiDPI
+            (2560, 1440), (2048, 1152), (1920, 1080),
+            (1760, 990), (1680, 945), (1600, 900),
+            (1440, 810), (1360, 765), (1280, 720), (1024, 576),
+            (nativeWidth / 2, nativeHeight / 2)
+        ]
+        for (w, h) in hiDPIModes {
+            addHiDPI(w, h)
+        }
+
+        // Non-HiDPI scaled entries (helps macOS enumerate the full list)
+        let nonHiDPIModes: [(Int, Int)] = [
+            (2048, 1152), (1920, 1080), (1680, 945),
+            (1440, 810), (1280, 720), (1024, 576)
+        ]
+        for (w, h) in nonHiDPIModes {
+            addNonHiDPI(w, h)
+        }
+
+        return result
     }
 }
